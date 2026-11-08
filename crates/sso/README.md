@@ -21,7 +21,7 @@ client.
    `exo_session` cookie (`HttpOnly; SameSite=Lax; Path=/`) and 302s to
    the assertion's `ret` claim after safe-path validation (must start
    with `/`, no `//`, no `:`, no backslash).
-5. `/auth/logout` clears the cookie and 302s to `/`.
+5. `/auth/logout` (POST only) clears the cookie and 302s to `/`.
 
 ## Configuration
 

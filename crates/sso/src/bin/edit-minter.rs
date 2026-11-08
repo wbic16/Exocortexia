@@ -8,8 +8,13 @@
 //! never expose it beyond a local demo.
 //!
 //! Environment:
-//! * `MOCK_SSO_SECRET` (or `EXO_SSO_SECRET`) — assertion signing secret,
-//!   must match the app's `EXO_SSO_SECRET`. Required.
+//! * `MOCK_SSO_SECRET` — assertion signing secret; for the demo it
+//!   must match the app's `EXO_SSO_SECRET`. Required. This binary
+//!   deliberately does NOT fall back to reading `EXO_SSO_SECRET`
+//!   itself, and it is only built with the `mock-minter` cargo
+//!   feature (F-05): a production build of exo-sso does not contain
+//!   it. Build it with:
+//!   `cargo build -p exo-sso --features mock-minter --bin edit-minter`
 //! * `APP_CALLBACK` — full app callback URL, e.g.
 //!   `http://127.0.0.1:8801/auth/callback`. Required.
 //! * `MOCK_PORT` — listen port, default 8799.
@@ -25,16 +30,20 @@ use exo_core::http::{serve, Request, Response};
 use std::sync::Arc;
 
 fn main() {
+    // MOCK_SSO_SECRET only (F-05): never silently pick up the real
+    // EXO_SSO_SECRET from the environment — an operator must name the
+    // mock secret explicitly, so this binary cannot wake up as an
+    // open assertion minter inside a production-shaped environment.
     let secret = std::env::var("MOCK_SSO_SECRET")
         .ok()
-        .filter(|s| !s.is_empty())
-        .or_else(|| std::env::var("EXO_SSO_SECRET").ok().filter(|s| !s.is_empty()));
+        .filter(|s| !s.is_empty());
     let secret = match secret {
         Some(s) => s,
         None => {
             eprintln!(
-                "edit-minter: MOCK_SSO_SECRET (or EXO_SSO_SECRET) must be set — \
-                 it must match the app's EXO_SSO_SECRET"
+                "edit-minter: MOCK_SSO_SECRET must be set — for the demo it must \
+                 match the app's EXO_SSO_SECRET (this mock never reads \
+                 EXO_SSO_SECRET itself)"
             );
             std::process::exit(1);
         }

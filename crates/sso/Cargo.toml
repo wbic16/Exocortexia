@@ -9,6 +9,17 @@ description = "Exocortexia SSO gate: HMAC-signed assertions from edit.phext.io a
 name = "exo_sso"
 path = "src/lib.rs"
 
+# The mock identity minter is a demo-only binary (F-05): it is built
+# only when this feature is explicitly enabled, so a default or
+# production build of exo-sso never contains it.
+[features]
+mock-minter = []
+
+[[bin]]
+name = "edit-minter"
+path = "src/bin/edit-minter.rs"
+required-features = ["mock-minter"]
+
 [dependencies]
 exo-core = { path = "../core" }
 hmac = "0.12"
