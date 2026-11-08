@@ -34,6 +34,35 @@ struct AppState {
     audit_store: Store,
     /// Hash-chained audit log over `audit_store`.
     audit: AuditLog,
+    /// When `EXO_STATE_DIR` is set, the redaction and audit stores
+    /// persist there as phext files and are reloaded at startup, so
+    /// the audit trail survives restarts (pen-test F-11). Unset, the
+    /// app is purely in-memory (the original demo behaviour).
+    state_dir: Option<std::path::PathBuf>,
+}
+
+/// Directory for persisted state, from `EXO_STATE_DIR`.
+fn state_dir() -> Option<std::path::PathBuf> {
+    std::env::var("EXO_STATE_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+/// Write the mutable stores to the state dir (best-effort: a failed
+/// write is logged, never fatal to the request that triggered it).
+fn persist_state(state: &AppState) {
+    let Some(dir) = &state.state_dir else { return };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("records-desk: cannot create state dir: {}", e);
+        return;
+    }
+    if let Err(e) = state.redactions.save(&dir.join("records-redactions.phext")) {
+        eprintln!("records-desk: cannot persist redactions: {}", e);
+    }
+    if let Err(e) = state.audit_store.save(&dir.join("records-audit.phext")) {
+        eprintln!("records-desk: cannot persist audit log: {}", e);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -157,20 +186,41 @@ fn build_state() -> AppState {
         let text = build_doc(&mut rng, i);
         docs.set(&doc_coord(i), &text);
     }
-    let mut audit_store = Store::new();
-    let mut audit = AuditLog::new();
-    audit.append(
-        &mut audit_store,
-        "records-desk",
-        "seed_corpus",
-        "1.1.1/1.1.1/1.1.1",
-        &format!("seeded {} synthetic documents", DOC_COUNT),
-    );
+    let dir = state_dir();
+    // Reload persisted redaction/audit stores when a state dir is
+    // configured and files exist (pen-test F-11).
+    let redactions = dir
+        .as_ref()
+        .and_then(|d| Store::load(&d.join("records-redactions.phext")).ok())
+        .unwrap_or_default();
+    let mut audit_store = dir
+        .as_ref()
+        .and_then(|d| Store::load(&d.join("records-audit.phext")).ok())
+        .unwrap_or_default();
+    let mut audit = AuditLog::open(&audit_store);
+    // Optional keyed audit chain (F-04): EXO_AUDIT_KEY is a
+    // server-only secret; when set, chain hashes cannot be recomputed
+    // from the store alone.
+    if let Ok(k) = std::env::var("EXO_AUDIT_KEY") {
+        if !k.is_empty() {
+            audit.set_key(k.as_bytes());
+        }
+    }
+    if audit.is_empty() {
+        audit.append(
+            &mut audit_store,
+            "records-desk",
+            "seed_corpus",
+            "1.1.1/1.1.1/1.1.1",
+            &format!("seeded {} synthetic documents", DOC_COUNT),
+        );
+    }
     AppState {
         docs,
-        redactions: Store::new(),
+        redactions,
         audit_store,
         audit,
+        state_dir: dir,
     }
 }
 
@@ -206,10 +256,14 @@ fn json_error(status: u16, message: &str) -> Response {
 }
 
 fn not_found(what: &str) -> Response {
+    // The echoed value is request input; HTML-escape it even in this
+    // text/plain body so the reflection is inert if any downstream
+    // consumer re-serves it as HTML (pen-test F-07). Responses also
+    // carry `X-Content-Type-Options: nosniff` from the HTTP layer.
     Response {
         status: 404,
         content_type: "text/plain; charset=utf-8".to_string(),
-        body: format!("not found: {}", what),
+        body: format!("not found: {}", esc(what)),
         headers: Vec::new(),
     }
 }
@@ -284,10 +338,24 @@ struct SearchHit {
     snippet: String,
 }
 
-/// Case-insensitive substring search over the full text of every document.
-/// An empty query matches every document. At most `limit` hits, in
-/// coordinate order.
-fn search_docs(docs: &Store, q: &str, limit: usize) -> Vec<SearchHit> {
+/// The public (redacted) view of one document: the original text with
+/// that document's redactions applied. Search, snippets, subjects, and
+/// export operate on this view ONLY (F-03) — searching the originals
+/// would make search a boolean oracle over redacted bytes and leak
+/// ±60 characters around every match through snippets.
+fn public_view(docs: &Store, redactions: &Store, coord: &str) -> Option<String> {
+    let original = docs.get(coord)?;
+    let mine: Vec<Redaction> = exo_core::load_redactions(redactions)
+        .into_iter()
+        .filter(|r| r.target == coord)
+        .collect();
+    Some(exo_core::apply_redactions(original, &mine))
+}
+
+/// Case-insensitive substring search over the *redacted public view*
+/// of every document. An empty query matches every document. At most
+/// `limit` hits, in coordinate order.
+fn search_docs(docs: &Store, redactions: &Store, q: &str, limit: usize) -> Vec<SearchHit> {
     let needle = q.to_lowercase();
     let mut coords = docs.coords();
     coords.sort_by_key(|c| coord_seq(c));
@@ -296,7 +364,7 @@ fn search_docs(docs: &Store, q: &str, limit: usize) -> Vec<SearchHit> {
         if hits.len() >= limit {
             break;
         }
-        let text = match docs.get(&coord) {
+        let text = match public_view(docs, redactions, &coord) {
             Some(t) => t,
             None => continue,
         };
@@ -304,8 +372,8 @@ fn search_docs(docs: &Store, q: &str, limit: usize) -> Vec<SearchHit> {
             continue;
         }
         hits.push(SearchHit {
-            subject: subject_of(text),
-            snippet: make_snippet(text, q),
+            subject: subject_of(&text),
+            snippet: make_snippet(&text, q),
             coord,
         });
     }
@@ -423,7 +491,7 @@ fn handle_index(
     body.push_str("<button type=\"submit\">Search</button>");
     body.push_str("</form>");
     if let Some(query) = q {
-        let hits = search_docs(&state.docs, query, 50);
+        let hits = search_docs(&state.docs, &state.redactions, query, 50);
         body.push_str(&format!(
             "<h2>{} result(s) for &ldquo;{}&rdquo;</h2>",
             hits.len(),
@@ -451,7 +519,7 @@ fn handle_api_search(state: &AppState, req: &Request) -> Response {
     let q = req.query.get("q").map(|s| s.as_str()).unwrap_or("");
     // Contract: an empty query returns all documents, limited to 50.
     let limit = if q.is_empty() { 50 } else { usize::MAX };
-    let hits = search_docs(&state.docs, q, limit);
+    let hits = search_docs(&state.docs, &state.redactions, q, limit);
     let mut out = String::from("[");
     for (i, hit) in hits.iter().enumerate() {
         if i > 0 {
@@ -473,6 +541,8 @@ fn handle_doc(
     banner: &str,
     session: Option<&Session>,
     req: &Request,
+    custodian: bool,
+    csrf_token: Option<&str>,
 ) -> Response {
     let coord = match req.query.get("coord") {
         Some(c) if !c.is_empty() => c.clone(),
@@ -511,21 +581,41 @@ fn handle_doc(
         redaction_list.push_str("</ul>");
     }
 
+    // The custodian view (original bytes) is rendered ONLY for an
+    // authenticated staff identity (F-01). For everyone else — and in
+    // demo mode, where no identity exists — the original never leaves
+    // the store through this page.
+    let custodian_section = if custodian {
+        format!(
+            "<p><a href=\"#custodian-view\">custodian view (original)</a></p>\n\
+             <section id=\"custodian-view\">\n<h2>Custodian view (original)</h2>\n\
+             <p>For the records custodian only. These are the original bytes, \
+             exactly as stored; applying or removing redactions never rewrites them.</p>\n\
+             <pre>{}</pre>\n</section>",
+            esc(&original)
+        )
+    } else {
+        String::new()
+    };
+    let csrf_input = match csrf_token {
+        Some(t) => format!("<input type=\"hidden\" name=\"_csrf\" value=\"{}\">\n", esc(t)),
+        None => String::new(),
+    };
     let body = format!(
-        "<p><a href=\"/\">Back to search</a> | <a href=\"#custodian-view\">custodian view (original)</a></p>\n\
+        "<p><a href=\"/\">Back to search</a></p>\n\
          <h2>Redacted public view</h2>\n\
          <p>This is the view released to a requester. Redacted ranges are \
          replaced by category markers; the underlying scroll is unchanged.</p>\n\
          <pre>{redacted}</pre>\n\
-         <section id=\"custodian-view\">\n<h2>Custodian view (original)</h2>\n\
-         <p>For the records custodian only. These are the original bytes, \
-         exactly as stored; applying or removing redactions never rewrites them.</p>\n\
-         <pre>{original}</pre>\n</section>\n\
+         {custodian_section}\n\
          <h2>Recorded redactions</h2>\n{redaction_list}\n\
          <h2>Add a redaction</h2>\n\
          <p>Byte offsets refer to the original document text. The category \
-         must be one of the Neb. Rev. Stat. 84-712.05 exceptions.</p>\n\
+         must be one of the Neb. Rev. Stat. 84-712.05 exceptions. The audit \
+         log records the signed-in identity — there is no actor field, \
+         because a free-text actor would let anyone forge attribution (F-12).</p>\n\
          <form method=\"post\" action=\"/api/redact\">\n\
+         {csrf_input}\
          <input type=\"hidden\" name=\"coord\" value=\"{coord}\">\n\
          <label for=\"start\">Start byte</label>\n\
          <input id=\"start\" name=\"start\" type=\"number\" min=\"0\" required>\n\
@@ -535,12 +625,11 @@ fn handle_doc(
          <select id=\"category\" name=\"category\">{options}</select>\n\
          <label for=\"reason\">Reason</label>\n\
          <input id=\"reason\" name=\"reason\" type=\"text\" required>\n\
-         <label for=\"actor\">Actor (your name or role)</label>\n\
-         <input id=\"actor\" name=\"actor\" type=\"text\" value=\"custodian\">\n\
          <button type=\"submit\">Record redaction</button>\n\
          </form>",
         redacted = esc(&redacted_view),
-        original = esc(&original),
+        custodian_section = custodian_section,
+        csrf_input = csrf_input,
         redaction_list = redaction_list,
         coord = esc(&coord),
         options = options,
@@ -548,16 +637,19 @@ fn handle_doc(
     Response::html(page_shell("Record document", banner, session, &body))
 }
 
-fn handle_redact(state: &mut AppState, req: &Request) -> Response {
+fn handle_redact(state: &mut AppState, req: &Request, session: Option<&Session>) -> Response {
     let fields = form(req);
     let get = |k: &str| fields.get(k).cloned().unwrap_or_default();
     let coord = get("coord");
     let category = get("category");
     let reason = get("reason");
-    let mut actor = get("actor");
-    if actor.trim().is_empty() {
-        actor = "custodian".to_string();
-    }
+    // The audit actor is the authenticated identity, never form input
+    // (F-12). In demo mode there is no identity; the entry says so.
+    let actor = match session {
+        Some(s) if !s.handle.is_empty() => s.handle.clone(),
+        Some(s) => s.sub.clone(),
+        None => "demo-mode (unauthenticated)".to_string(),
+    };
     let start: usize = match get("start").parse() {
         Ok(v) => v,
         Err(_) => return json_error(400, "start must be a non-negative integer"),
@@ -602,6 +694,7 @@ fn handle_redact(state: &mut AppState, req: &Request) -> Response {
             category, start, end, reason
         ),
     );
+    persist_state(state);
     Response::json(format!("{{\"ok\":true,\"id\":\"{}\"}}", json_escape(&id)))
 }
 
@@ -611,11 +704,13 @@ fn handle_export(state: &AppState, req: &Request) -> Response {
         .get("q")
         .cloned()
         .unwrap_or_else(|| "InterRAI".to_string());
-    let hits = search_docs(&state.docs, &q, usize::MAX);
+    let hits = search_docs(&state.docs, &state.redactions, &q, usize::MAX);
     let mut responsive_bytes = 0usize;
     let mut set_list = String::new();
     for hit in &hits {
-        if let Some(text) = state.docs.get(&hit.coord) {
+        // Worksheet bytes are the *released* (redacted) bytes (F-03):
+        // counting originals would leak the length of withheld text.
+        if let Some(text) = public_view(&state.docs, &state.redactions, &hit.coord) {
             responsive_bytes += text.len();
         }
         set_list.push_str(&format!("{}  {}\n", hit.coord, hit.subject));
@@ -691,16 +786,36 @@ fn handle_export(state: &AppState, req: &Request) -> Response {
 // Router + main (SSO gate pattern per API-CONTRACT.md)
 // ---------------------------------------------------------------------------
 
+/// CSRF gate for state-changing POSTs (F-11): with a session, the
+/// per-session token is required; without one (demo mode), a
+/// cross-site Origin/Referer is refused.
+fn csrf_ok(req: &Request, sso: Option<&Sso>, session: Option<&Session>) -> bool {
+    if !exo_core::http::origin_matches_host(req) {
+        return false;
+    }
+    match (sso, session) {
+        (Some(s), Some(sess)) => {
+            let fields = form(req);
+            fields
+                .get("_csrf")
+                .map(|t| s.csrf_ok(sess, t))
+                .unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
 fn route(
     req: &Request,
     session: Option<Session>,
     banner: &str,
     state: &Arc<Mutex<AppState>>,
+    sso: Option<&Sso>,
 ) -> Response {
     let session_ref = session.as_ref();
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
             handle_index(
                 &st,
                 banner,
@@ -709,19 +824,28 @@ fn route(
             )
         }
         ("GET", "/api/search") => {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
             handle_api_search(&st, req)
         }
         ("GET", "/doc") => {
-            let st = state.lock().unwrap();
-            handle_doc(&st, banner, session_ref, req)
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
+            // Custodian view + CSRF token exist only for an
+            // authenticated staff session (F-01).
+            let (custodian, csrf) = match (sso, session_ref) {
+                (Some(s), Some(sess)) => (s.is_staff(sess), Some(s.csrf_token(sess))),
+                _ => (false, None),
+            };
+            handle_doc(&st, banner, session_ref, req, custodian, csrf.as_deref())
         }
         ("POST", "/api/redact") => {
-            let mut st = state.lock().unwrap();
-            handle_redact(&mut st, req)
+            if !csrf_ok(req, sso, session_ref) {
+                return json_error(403, "CSRF check failed");
+            }
+            let mut st = state.lock().unwrap_or_else(|e| e.into_inner());
+            handle_redact(&mut st, req, session_ref)
         }
         ("GET", "/api/export") => {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
             handle_export(&st, req)
         }
         _ => not_found(&req.path),
@@ -734,7 +858,7 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8801);
     let state = Arc::new(Mutex::new(build_state()));
-    let sso = SsoConfig::from_env().map(Sso::new);
+    let sso = SsoConfig::from_env_for("records-desk").map(Sso::new);
     let banner = match &sso {
         Some(s) => s.banner_html().to_string(),
         None => "AUTH DISABLED — local demo mode (SSO not configured)".to_string(),
@@ -747,11 +871,13 @@ fn main() -> std::io::Result<()> {
         if let Some(s) = &sso {
             match s.gate(req) {
                 Gate::Respond(r) => return r,
-                Gate::Authed(sess) => return route(req, Some(sess), &banner, &state),
+                Gate::Authed(sess) => {
+                    return route(req, Some(sess), &banner, &state, Some(s))
+                }
                 Gate::PassThrough => {}
             }
         }
-        route(req, None, &banner, &state)
+        route(req, None, &banner, &state, None)
     })
 }
 
@@ -779,7 +905,7 @@ mod tests {
         // The InterRAI topic is in the deterministic cycle, so a
         // case-insensitive search must find many hits whose subjects
         // name InterRAI.
-        let hits = search_docs(&docs, "interrai", usize::MAX);
+        let hits = search_docs(&docs, &Store::new(), "interrai", usize::MAX);
         assert!(
             hits.len() >= 40,
             "expected many InterRAI hits, got {}",
@@ -788,16 +914,16 @@ mod tests {
         assert!(hits.iter().all(|h| h.subject.contains("InterRAI")));
         assert!(hits.iter().all(|h| !h.snippet.is_empty()));
         // Case-insensitivity: upper-case query finds the same set.
-        let upper = search_docs(&docs, "INTERRAI", usize::MAX);
+        let upper = search_docs(&docs, &Store::new(), "INTERRAI", usize::MAX);
         assert_eq!(hits.len(), upper.len());
         // A topic term unique to one cycle slot also resolves.
-        let bridges = search_docs(&docs, "bridge maintenance", usize::MAX);
+        let bridges = search_docs(&docs, &Store::new(), "bridge maintenance", usize::MAX);
         assert!(!bridges.is_empty());
         // Empty query returns everything up to the caller's limit.
-        let all = search_docs(&docs, "", 50);
+        let all = search_docs(&docs, &Store::new(), "", 50);
         assert_eq!(all.len(), 50);
         // Nonsense query finds nothing.
-        assert!(search_docs(&docs, "zzz-no-such-term", usize::MAX).is_empty());
+        assert!(search_docs(&docs, &Store::new(), "zzz-no-such-term", usize::MAX).is_empty());
     }
 
     #[test]
@@ -830,6 +956,46 @@ mod tests {
         );
         // The layer is separate: the stored original is byte-identical.
         assert_eq!(docs.get(&coord).unwrap(), original);
+    }
+
+    #[test]
+    fn search_cannot_see_redacted_text() {
+        // F-03 regression: search runs over the redacted public view.
+        // A fully redacted document must be invisible to a search for
+        // its own unique text — no hit, no snippet, no subject leak.
+        let docs = test_docs();
+        let coord = doc_coord(1);
+        let original = docs.get(&coord).unwrap().to_string();
+        // The per-document reference phrase is unique to this doc.
+        let start = original.find("Reference number for this item is").unwrap();
+        let phrase: String = original[start..].chars().take(45).collect();
+        let needle = phrase.trim_end_matches('.').to_string();
+        // Sanity: without redactions the doc is findable by it.
+        let before = search_docs(&docs, &Store::new(), &needle, usize::MAX);
+        assert!(before.iter().any(|h| h.coord == coord));
+
+        // Redact the entire document.
+        let mut rstore = Store::new();
+        exo_core::add_redaction(
+            &mut rstore,
+            &Redaction {
+                target: coord.clone(),
+                start: 0,
+                end: original.len(),
+                category: REDACTION_CATEGORIES[0].to_string(),
+                reason: "oracle regression test".to_string(),
+                id: String::new(),
+            },
+        );
+        let after = search_docs(&docs, &rstore, &needle, usize::MAX);
+        assert!(
+            after.iter().all(|h| h.coord != coord),
+            "redacted document must not be a search hit for its own text"
+        );
+        // And the document page's public view carries none of it.
+        let view = public_view(&docs, &rstore, &coord).unwrap();
+        assert!(!view.contains(&needle));
+        assert!(view.contains("[REDACTED"));
     }
 
     #[test]
