@@ -217,6 +217,12 @@ impl Submission {
 /// sha256(form | seq | k1=v1 | k2=v2 | ...), with values in spec order.
 /// Pure: the same form, sequence, and values always yield the same code,
 /// so a code can be re-derived and checked without a lookup table.
+///
+/// Retained as a content checksum only. It is NOT used as the
+/// tracking credential any more (F-17): its inputs are a small
+/// sequential counter plus the requester's own low-entropy field
+/// values, so anyone could recompute or brute-force codes offline
+/// and read strangers' submissions through `/track`.
 pub fn tracking_code(form_name: &str, seq: u64, values: &[(String, String)]) -> String {
     let mut material = format!("{}|{}", form_name, seq);
     for (k, v) in values {
@@ -227,6 +233,41 @@ pub fn tracking_code(form_name: &str, seq: u64, values: &[(String, String)]) -> 
     }
     let digest = exo_core::sha256_hex(material.as_bytes());
     digest.chars().take(10).collect()
+}
+
+/// Mint a fresh tracking code: 128 bits from the OS CSPRNG
+/// (`/dev/urandom`), hex-encoded. This is the code stored on the
+/// submission and handed to the requester — the sole credential for
+/// `/track`, so it must be unguessable (F-17).
+pub fn random_tracking_code() -> String {
+    use std::io::Read;
+    let mut buf = [0u8; 16];
+    let filled = std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut buf))
+        .is_ok();
+    if !filled {
+        // Fallback (non-Unix or restricted sandbox): hash together
+        // time, pid, and a process-local counter. Weaker than the
+        // CSPRNG path but still not derivable from submission data.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static CTR: AtomicU64 = AtomicU64::new(0);
+        let n = CTR.fetch_add(1, Ordering::SeqCst);
+        let material = format!(
+            "tracking|{}|{}|{}",
+            exo_core::now_unix(),
+            std::process::id(),
+            n
+        );
+        return exo_core::sha256_hex(material.as_bytes())
+            .chars()
+            .take(32)
+            .collect();
+    }
+    let mut out = String::with_capacity(32);
+    for b in buf {
+        out.push_str(&format!("{:02x}", b));
+    }
+    out
 }
 
 /// Field values must not break the scroll line format: fold CR/LF to a
@@ -243,8 +284,18 @@ pub fn sanitize_value(v: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// RFC 4180 quoting: quote when the field contains a comma, quote, or
-/// newline; double any embedded quotes.
+/// newline; double any embedded quotes. A leading `=`, `+`, `-`, `@`,
+/// tab, or CR is prefixed with `'` first (F-18): spreadsheet
+/// applications would otherwise evaluate the cell as a formula when
+/// the export is opened.
 pub fn csv_escape(field: &str) -> String {
+    let guarded;
+    let field = if field.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        guarded = format!("'{}", field);
+        &guarded
+    } else {
+        field
+    };
     if field.contains(',') || field.contains('"') || field.contains('\n') || field.contains('\r') {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
@@ -355,17 +406,44 @@ struct App {
     submissions: Mutex<Store>,
     audit: Mutex<AuditState>,
     seq: Mutex<u64>,
+    /// When `EXO_STATE_DIR` is set, the submissions and audit stores
+    /// persist there as phext files and are reloaded at startup, so
+    /// submissions and the audit trail survive restarts (pen-test
+    /// F-11). Unset, the app is purely in-memory (demo behaviour).
+    state_dir: Option<std::path::PathBuf>,
+}
+
+/// Write the mutable stores to the state dir (best-effort; failures
+/// are logged, never fatal to the triggering request).
+fn persist(app: &App) {
+    let Some(dir) = &app.state_dir else { return };
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        eprintln!("forms-router: cannot create state dir: {}", e);
+        return;
+    }
+    {
+        let store = app.submissions.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = store.save(&dir.join("forms-submissions.phext")) {
+            eprintln!("forms-router: cannot persist submissions: {}", e);
+        }
+    }
+    {
+        let audit = app.audit.lock().unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = audit.store.save(&dir.join("forms-audit.phext")) {
+            eprintln!("forms-router: cannot persist audit log: {}", e);
+        }
+    }
 }
 
 impl App {
     fn audit_append(&self, actor: &str, action: &str, coord: &str, payload: &str) {
-        let mut audit = self.audit.lock().unwrap();
+        let mut audit = self.audit.lock().unwrap_or_else(|e| e.into_inner());
         let AuditState { log, store } = &mut *audit;
         log.append(store, actor, action, coord, payload);
     }
 
     fn all_submissions(&self) -> Vec<Submission> {
-        let store = self.submissions.lock().unwrap();
+        let store = self.submissions.lock().unwrap_or_else(|e| e.into_inner());
         let mut subs: Vec<Submission> = store
             .coords()
             .iter()
@@ -409,7 +487,7 @@ fn page_shell(title: &str, banner: &str, sess: &Option<&Session>, body: &str) ->
 
 /// Render the submission form from the spec scroll: one labelled input per
 /// `field=` line, in spec order. `description` gets a textarea.
-fn render_spec_form(spec: &FormSpec) -> String {
+fn render_spec_form(spec: &FormSpec, csrf_token: Option<&str>) -> String {
     let mut inputs = String::new();
     for field in &spec.fields {
         let id = format!("f-{}", field);
@@ -431,17 +509,22 @@ fn render_spec_form(spec: &FormSpec) -> String {
             ));
         }
     }
+    let csrf_input = match csrf_token {
+        Some(t) => format!("<input type=\"hidden\" name=\"_csrf\" value=\"{}\">\n", esc(t)),
+        None => String::new(),
+    };
     format!(
-        "<h3>{}</h3>\n<form method=\"post\" action=\"/api/submit\">\n{}<p><button type=\"submit\">Submit request</button></p>\n</form>",
+        "<h3>{}</h3>\n<form method=\"post\" action=\"/api/submit\">\n{}{}<p><button type=\"submit\">Submit request</button></p>\n</form>",
         esc(&spec.title),
+        csrf_input,
         inputs
     )
 }
 
-fn index_page(app: &App, banner: &str, sess: &Option<&Session>) -> Response {
+fn index_page(app: &App, banner: &str, sess: &Option<&Session>, csrf_token: Option<&str>) -> Response {
     let body = format!(
         "<h2><strong>SYNTHETIC DATA ONLY — DO NOT ENTER PERSONAL INFORMATION</strong></h2>\n<p>This demonstration form asks only for the agency, subject, description, and date range of a records request. It has <strong>no name, email, or contact fields by design</strong>: you will receive a tracking code to follow your request, and no account or personal information is needed.</p>\n{}\n<h3>Track a request</h3>\n<form method=\"get\" action=\"/track\">\n<p><label for=\"track-code\">Tracking code</label><br><input id=\"track-code\" name=\"code\" type=\"text\" size=\"20\" required></p>\n<p><button type=\"submit\">Look up status</button></p>\n</form>",
-        render_spec_form(&app.spec)
+        render_spec_form(&app.spec, csrf_token)
     );
     Response::html(page_shell("Forms Router", banner, sess, &body))
 }
@@ -512,7 +595,7 @@ fn json_response(status: u16, body: String) -> Response {
     }
 }
 
-fn transition_route(req: &Request, app: &App) -> Response {
+fn transition_route(req: &Request, app: &App, actor: &str) -> Response {
     let form_map = form(req);
     let code = form_map.get("code").cloned().unwrap_or_default();
     let to_raw = form_map.get("to").cloned().unwrap_or_default();
@@ -544,10 +627,11 @@ fn transition_route(req: &Request, app: &App) -> Response {
         Ok(()) => {
             let scroll = sub.to_scroll();
             {
-                let mut store = app.submissions.lock().unwrap();
+                let mut store = app.submissions.lock().unwrap_or_else(|e| e.into_inner());
                 store.set(&sub.coord, &scroll);
             }
-            app.audit_append("staff", "transition", &sub.coord, &scroll);
+            app.audit_append(actor, "transition", &sub.coord, &scroll);
+            persist(app);
             json_response(
                 200,
                 format!(
@@ -576,18 +660,86 @@ fn export_csv(app: &App) -> Response {
 // Routing + main
 // ---------------------------------------------------------------------------
 
-fn route(req: &Request, sess: Option<&Session>, app: &App, banner: &str) -> Response {
+/// Staff context (F-07): with SSO configured, only an
+/// `EXO_STAFF_SUBS` identity may run staff actions. In demo mode
+/// there are no identities at all — the app is openly a demo (the
+/// banner says so) and staff actions stay available; the moment SSO
+/// is configured they fail closed.
+fn staff_ok(sso: Option<&Sso>, sess: Option<&Session>) -> bool {
+    match (sso, sess) {
+        (Some(s), Some(x)) => s.is_staff(x),
+        (Some(_), None) => false,
+        (None, _) => true,
+    }
+}
+
+/// CSRF gate for POSTs (F-11): session token when a session exists,
+/// Origin/Host match in all cases where the browser sends Origin.
+fn csrf_ok(req: &Request, sso: Option<&Sso>, sess: Option<&Session>) -> bool {
+    if !exo_core::http::origin_matches_host(req) {
+        return false;
+    }
+    match (sso, sess) {
+        (Some(s), Some(x)) => {
+            let fields = form(req);
+            fields
+                .get("_csrf")
+                .map(|t| s.csrf_ok(x, t))
+                .unwrap_or(false)
+        }
+        _ => true,
+    }
+}
+
+fn route(
+    req: &Request,
+    sess: Option<&Session>,
+    app: &App,
+    banner: &str,
+    sso: Option<&Sso>,
+) -> Response {
     let sess_ref = &sess;
     match (req.method.as_str(), req.path.as_str()) {
-        ("GET", "/") => index_page(app, banner, sess_ref),
+        ("GET", "/") => {
+            let csrf = match (sso, sess) {
+                (Some(s), Some(x)) => Some(s.csrf_token(x)),
+                _ => None,
+            };
+            index_page(app, banner, sess_ref, csrf.as_deref())
+        }
         ("GET", "/health") => Response::text("ok".to_string()),
-        ("POST", "/api/submit") => submit_route(req, app, banner, sess_ref),
-        ("POST", "/api/transition") => transition_route(req, app),
+        ("POST", "/api/submit") => {
+            if !csrf_ok(req, sso, sess) {
+                return json_response(403, "{\"error\":\"CSRF check failed\"}".to_string());
+            }
+            submit_route(req, app, banner, sess_ref)
+        }
+        ("POST", "/api/transition") => {
+            if !staff_ok(sso, sess) {
+                return json_response(
+                    403,
+                    "{\"error\":\"staff identity required\"}".to_string(),
+                );
+            }
+            if !csrf_ok(req, sso, sess) {
+                return json_response(403, "{\"error\":\"CSRF check failed\"}".to_string());
+            }
+            let actor = sess.map(|x| x.sub.as_str()).unwrap_or("demo-mode");
+            transition_route(req, app, actor)
+        }
         ("GET", "/track") => {
             let code = req.query.get("code").cloned().unwrap_or_default();
             track_page(app, &code, banner, sess_ref)
         }
-        ("GET", "/api/export.csv") => export_csv(app),
+        ("GET", "/api/export.csv") => {
+            if !staff_ok(sso, sess) {
+                return json_response(
+                    403,
+                    "{\"error\":\"staff identity required\"}".to_string(),
+                );
+            }
+            export_csv(app)
+        }
         _ => Response {
             status: 404,
             content_type: "text/plain; charset=utf-8".to_string(),
@@ -618,12 +770,23 @@ fn submit_route(
             )
         })
         .collect();
+    // Server-side required-field validation: the HTML form marks the
+    // fields `required`, but the API must enforce it too — an empty
+    // submission must not be issued a tracking code (pen-test F-08).
+    if values.iter().any(|(_, v)| v.trim().is_empty()) {
+        return json_response(
+            400,
+            "{\"error\":\"all form fields are required\"}".to_string(),
+        );
+    }
     let seq = {
-        let mut guard = app.seq.lock().unwrap();
+        let mut guard = app.seq.lock().unwrap_or_else(|e| e.into_inner());
         *guard += 1;
         *guard
     };
-    let code = tracking_code(&app.spec.name, seq, &values);
+    // The tracking code is a random credential (F-17), not a
+    // derivation from the submission's own data.
+    let code = random_tracking_code();
     let ts = exo_core::now_unix();
     let sub = Submission {
         coord: format!("{}.{}", SUBMISSION_SHELF, seq),
@@ -640,10 +803,11 @@ fn submit_route(
     };
     let scroll = sub.to_scroll();
     {
-        let mut store = app.submissions.lock().unwrap();
+        let mut store = app.submissions.lock().unwrap_or_else(|e| e.into_inner());
         store.set(&sub.coord, &scroll);
     }
     app.audit_append("public", "submit", &sub.coord, &scroll);
+    persist(app);
     submitted_page(&sub, banner, sess)
 }
 
@@ -654,17 +818,45 @@ fn main() -> std::io::Result<()> {
         .unwrap_or(DEFAULT_PORT);
 
     let spec = parse_spec(&spec_store()).expect("built-in form spec must parse");
+    // Reload persisted state when EXO_STATE_DIR is configured
+    // (pen-test F-11).
+    let dir: Option<std::path::PathBuf> = std::env::var("EXO_STATE_DIR")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from);
+    let submissions_store = dir
+        .as_ref()
+        .and_then(|d| Store::load(&d.join("forms-submissions.phext")).ok())
+        .unwrap_or_default();
+    let start_seq = submissions_store
+        .coords()
+        .iter()
+        .filter_map(|c| c.rsplit('.').next().and_then(|t| t.parse::<u64>().ok()))
+        .max()
+        .unwrap_or(0);
+    let audit_store = dir
+        .as_ref()
+        .and_then(|d| Store::load(&d.join("forms-audit.phext")).ok())
+        .unwrap_or_default();
+    let mut audit_log = AuditLog::open(&audit_store);
+    // Optional keyed audit chain (F-04), as in records-desk.
+    if let Ok(k) = std::env::var("EXO_AUDIT_KEY") {
+        if !k.is_empty() {
+            audit_log.set_key(k.as_bytes());
+        }
+    }
     let app = Arc::new(App {
         spec,
-        submissions: Mutex::new(Store::new()),
+        submissions: Mutex::new(submissions_store),
         audit: Mutex::new(AuditState {
-            log: AuditLog::new(),
-            store: Store::new(),
+            log: audit_log,
+            store: audit_store,
         }),
-        seq: Mutex::new(0),
+        seq: Mutex::new(start_seq),
+        state_dir: dir,
     });
 
-    let sso = SsoConfig::from_env().map(Sso::new);
+    let sso = SsoConfig::from_env_for("forms-router").map(Sso::new);
     let banner: String = match &sso {
         Some(s) => s.banner_html().to_string(),
         None => "AUTH DISABLED — local demo mode (SSO not configured)".to_string(),
@@ -681,12 +873,12 @@ fn main() -> std::io::Result<()> {
             match s.gate(req) {
                 Gate::Respond(r) => return r,
                 Gate::Authed(sess) => {
-                    return route(req, Some(&sess), &handler_app, &banner)
+                    return route(req, Some(&sess), &handler_app, &banner, Some(s))
                 }
                 Gate::PassThrough => {}
             }
         }
-        route(req, None, &handler_app, &banner)
+        route(req, None, &handler_app, &banner, None)
     })
 }
 
@@ -803,6 +995,30 @@ mod tests {
         let mut changed = values.clone();
         changed[1].1 = "Other".to_string();
         assert_ne!(a, tracking_code("public-records-request", 7, &changed));
+    }
+
+    #[test]
+    fn random_tracking_codes_are_unguessable_and_unique() {
+        // F-17 regression: codes are 128-bit random values, not a
+        // derivation from the submission's own (guessable) data.
+        let a = random_tracking_code();
+        let b = random_tracking_code();
+        assert_eq!(a.len(), 32);
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b);
+        // And they are not the old deterministic derivation.
+        let values = vec![("agency".to_string(), "State Patrol".to_string())];
+        assert_ne!(a, tracking_code("public-records-request", 1, &values));
+    }
+
+    #[test]
+    fn csv_formula_injection_is_neutralised() {
+        // F-18 regression.
+        assert_eq!(csv_escape("=2+5"), "'=2+5");
+        assert_eq!(csv_escape("+SUM(A1:A9)"), "'+SUM(A1:A9)");
+        assert_eq!(csv_escape("-10"), "'-10");
+        assert_eq!(csv_escape("@handle"), "'@handle");
+        assert_eq!(csv_escape("normal"), "normal");
     }
 
     #[test]
