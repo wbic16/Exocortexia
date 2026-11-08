@@ -231,30 +231,68 @@ fn audit_hash(
     action: &str,
     coord: &str,
     payload_sha256: &str,
+    key: Option<&[u8]>,
 ) -> String {
-    sha256_hex(
-        format!(
-            "{}|{}|{}|{}|{}|{}|{}",
-            prev_hash, seq, ts, actor, action, coord, payload_sha256
-        )
-        .as_bytes(),
-    )
+    let preimage = format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        prev_hash, seq, ts, actor, action, coord, payload_sha256
+    );
+    match key {
+        // Keyed chain (F-04): the hash input is prefixed with a
+        // server-only key, so an attacker who can rewrite the store
+        // but does not hold the key cannot recompute a valid chain.
+        Some(k) => {
+            let mut buf = Vec::with_capacity(k.len() + 1 + preimage.len());
+            buf.extend_from_slice(k);
+            buf.push(0);
+            buf.extend_from_slice(preimage.as_bytes());
+            sha256_hex(&buf)
+        }
+        None => sha256_hex(preimage.as_bytes()),
+    }
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct AuditLog {
     pub entries: Vec<AuditEntry>,
+    /// Audit-shaped scrolls that failed to parse when the log was
+    /// opened from a store. Non-zero means the store was tampered
+    /// with or corrupted; `verify()` refuses such a chain.
+    pub skipped_malformed: usize,
+    /// Optional server-only chain key (F-04). When set, entry hashes
+    /// are keyed and cannot be recomputed from the store contents
+    /// alone. Never stored in the store itself.
+    key: Option<Vec<u8>>,
 }
 
 impl AuditLog {
     pub fn new() -> AuditLog {
-        AuditLog { entries: Vec::new() }
+        AuditLog {
+            entries: Vec::new(),
+            skipped_malformed: 0,
+            key: None,
+        }
+    }
+
+    /// Key the chain with a server-only secret (see the `key` field).
+    /// Must be set before appending or verifying a keyed chain, and
+    /// the same key must be used for both.
+    pub fn set_key(&mut self, key: &[u8]) {
+        self.key = if key.is_empty() {
+            None
+        } else {
+            Some(key.to_vec())
+        };
     }
 
     /// Load the audit chain out of a Store, ordered by sequence number.
-    /// Malformed or non-audit scrolls are skipped.
+    /// Non-audit scrolls are ignored. Audit-shaped scrolls (audit
+    /// prefix + numeric suffix) that fail to parse are *counted* in
+    /// `skipped_malformed` rather than silently skipped, and make
+    /// `verify()` fail: a malformed audit scroll is tamper evidence.
     pub fn open(store: &Store) -> AuditLog {
         let mut found: Vec<(u64, AuditEntry)> = Vec::new();
+        let mut skipped_malformed = 0usize;
         for coord in store.coords() {
             let suffix = match coord.strip_prefix(AUDIT_PREFIX) {
                 Some(s) => s,
@@ -270,6 +308,7 @@ impl AuditLog {
             };
             let fields: Vec<&str> = line.trim_end().split('|').collect();
             if fields.len() != 8 {
+                skipped_malformed += 1;
                 continue;
             }
             let seq: u64 = fields[0].parse().unwrap_or(seq_hint);
@@ -291,6 +330,8 @@ impl AuditLog {
         found.sort_by_key(|(seq, _)| *seq);
         AuditLog {
             entries: found.into_iter().map(|(_, e)| e).collect(),
+            skipped_malformed,
+            key: None,
         }
     }
 
@@ -330,6 +371,7 @@ impl AuditLog {
             &action,
             &coord,
             &payload_sha256,
+            self.key.as_deref(),
         );
         let entry = AuditEntry {
             seq,
@@ -357,9 +399,69 @@ impl AuditLog {
         entry
     }
 
+    /// The chain head as `(entry count, head hash)`: the head hash is
+    /// the last entry's hash, or `AUDIT_GENESIS` for an empty chain.
+    pub fn head(&self) -> (usize, String) {
+        let head = self
+            .entries
+            .iter()
+            .max_by_key(|e| e.seq)
+            .map(|e| e.hash.clone())
+            .unwrap_or_else(|| AUDIT_GENESIS.to_string());
+        (self.entries.len(), head)
+    }
+
+    /// A single commitment string over `head()` — publish or pin this
+    /// value somewhere the store writer cannot reach (a log line, a
+    /// second system, a public page snapshot) and later call
+    /// `verify_with_head` against it to detect tail truncation, which
+    /// plain `verify()` cannot see (F-04).
+    pub fn head_commitment(&self) -> String {
+        let (n, head) = self.head();
+        sha256_hex(format!("audit-head|{}|{}", n, head).as_bytes())
+    }
+
+    /// `verify()` plus a comparison against an externally anchored
+    /// `(length, head hash)` pair previously obtained from `head()`.
+    /// A chain whose tail was dropped verifies fine on its own but
+    /// fails here: its length and head no longer match the anchor.
+    pub fn verify_with_head(
+        &self,
+        expected_len: usize,
+        expected_head: &str,
+    ) -> Result<(), String> {
+        self.verify()?;
+        let (n, head) = self.head();
+        if n != expected_len {
+            return Err(format!(
+                "audit chain length {} does not match anchored length {} (tail truncated or extended)",
+                n, expected_len
+            ));
+        }
+        if head != expected_head {
+            return Err(
+                "audit chain head does not match the anchored head hash".to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Recompute the whole chain. `Err` names the first bad sequence
     /// number and why it failed.
+    ///
+    /// What this proves: the entries *present* are internally
+    /// consistent (sequence, links, hashes). What it cannot prove on
+    /// its own: that no tail entries were dropped (anchor the head
+    /// with `head_commitment`/`verify_with_head`), and — for an
+    /// unkeyed chain — that a store writer did not rewrite and
+    /// recompute history (key the chain with `set_key`).
     pub fn verify(&self) -> Result<(), String> {
+        if self.skipped_malformed > 0 {
+            return Err(format!(
+                "audit store holds {} malformed audit scroll(s) (tamper or corruption evidence)",
+                self.skipped_malformed
+            ));
+        }
         let mut expected_seq: u64 = 1;
         let mut expected_prev = AUDIT_GENESIS.to_string();
         let mut ordered: Vec<&AuditEntry> = self.entries.iter().collect();
@@ -385,6 +487,7 @@ impl AuditLog {
                 &entry.action,
                 &entry.coord,
                 &entry.payload_sha256,
+                self.key.as_deref(),
             );
             if recomputed != entry.hash {
                 return Err(format!(
@@ -708,6 +811,77 @@ mod tests {
         store.set(&coord, &String::from_utf8(bytes).unwrap());
         let reloaded = AuditLog::open(&store);
         assert!(reloaded.verify().is_err());
+    }
+
+    #[test]
+    fn audit_tail_truncation_detected_against_anchored_head() {
+        // F-04 regression: plain verify() cannot see a dropped tail
+        // (documented limitation), but verify_with_head against an
+        // anchored (len, head) must catch it.
+        let mut store = Store::new();
+        let mut log = AuditLog::new();
+        log.append(&mut store, "clerk", "create", "1.1.1/1.1.1/1.1.1", "one");
+        log.append(&mut store, "clerk", "update", "1.1.1/1.1.1/1.1.1", "two");
+        log.append(&mut store, "clerk", "update", "1.1.1/1.1.1/1.1.1", "three");
+        let (len, head) = log.head();
+        assert_eq!(len, 3);
+        log.verify_with_head(len, &head)
+            .expect("honest chain must match its own head anchor");
+
+        // Drop the last entry's scroll: the remaining chain is
+        // internally consistent…
+        store.remove(&format!("{}3", AUDIT_PREFIX));
+        let truncated = AuditLog::open(&store);
+        assert_eq!(truncated.len(), 2);
+        truncated
+            .verify()
+            .expect("truncated chain is internally consistent (known limitation)");
+        // …but it no longer matches the anchored head.
+        let err = truncated
+            .verify_with_head(len, &head)
+            .expect_err("tail truncation must fail against the anchored head");
+        assert!(err.contains("length"), "got: {}", err);
+    }
+
+    #[test]
+    fn audit_malformed_scroll_is_tamper_evidence() {
+        // F-04 regression: a malformed audit-shaped scroll must not be
+        // silently skipped — verify() refuses the chain.
+        let mut store = Store::new();
+        let mut log = AuditLog::new();
+        log.append(&mut store, "clerk", "create", "1.1.1/1.1.1/1.1.1", "one");
+        store.set(&format!("{}77", AUDIT_PREFIX), "garbage|not|an|entry");
+        let opened = AuditLog::open(&store);
+        assert_eq!(opened.skipped_malformed, 1);
+        let err = opened
+            .verify()
+            .expect_err("malformed audit scroll must fail verification");
+        assert!(err.contains("malformed"), "got: {}", err);
+    }
+
+    #[test]
+    fn audit_keyed_chain_cannot_be_recomputed_without_the_key() {
+        // F-04 regression: a store writer who rewrites history and
+        // recomputes hashes *without* the server key produces a chain
+        // that fails verification under the key.
+        let key = b"server-only-audit-key";
+        let mut store = Store::new();
+        let mut log = AuditLog::new();
+        log.set_key(key);
+        log.append(&mut store, "clerk", "create", "1.1.1/1.1.1/1.1.1", "one");
+        log.append(&mut store, "clerk", "update", "1.1.1/1.1.1/1.1.1", "two");
+        log.verify().expect("keyed honest chain verifies");
+
+        // The same entries checked without the key (or with a wrong
+        // one) must fail: their hashes were computed keyed.
+        let mut unkeyed = AuditLog {
+            entries: log.entries.clone(),
+            skipped_malformed: 0,
+            key: None,
+        };
+        assert!(unkeyed.verify().is_err());
+        unkeyed.set_key(b"attacker-guessed-key");
+        assert!(unkeyed.verify().is_err());
     }
 
     #[test]
