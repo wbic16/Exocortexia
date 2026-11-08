@@ -41,7 +41,7 @@ Workspace deps ONLY: libphext = "0.4.0", sha2 = "0.10", hmac = "0.12", base64 = 
   - gate(&self, req:&Request)->Gate : routes:
     - path "/auth/callback": read query "assertion"; verify -> success: Respond(302 to safe ret path from claim "ret" default "/") with Set-Cookie exo_session=<sealed>; failure: Respond(401 text "SSO assertion rejected: <why>")
     - path "/auth/login": Respond(302 to {edit_sso_url}?return={url_encode(req query "return" or "/")}) — if edit_sso_url already contains '?', use '&'.
-    - path "/auth/logout": Respond(302 "/") clearing cookie.
+    - path "/auth/logout" (POST only; GET is 405): Respond(302 "/") clearing cookie.
     - otherwise: valid exo_session cookie -> Authed; else Respond(302 "/auth/login?return=<current path>") for GET pages; still 302 (demo simplicity) — document.
   - verify_assertion(&self, token:&str)->Result<Session,String> : format b64url(json).b64url(hmac); HMAC-SHA256 with sso_secret over the b64url(json) part; constant-time compare (compare decoded bytes with xor fold). JSON flat parse (write tiny parser): claims sub (string, required), aud (must == cfg.aud), exp (number, required, now<exp), iat (number; if present require exp-iat<=120 and iat<=now+30), jti (string, required; replay cache Mutex<HashMap<String,i64>> swept by exp; duplicate -> Err "replay").
   - mint_assertion(secret, sub, handle, aud, ret, ttl_secs)->String : pub, used by the minter bin and tests.

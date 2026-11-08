@@ -25,7 +25,7 @@ request through it before routing.
    own `exo_session` cookie. On failure it responds
    `401 SSO assertion rejected: <why>`.
 5. Later requests present `exo_session`; the gate opens it locally and lets
-   the request through as that session's user. `/auth/logout` clears the
+   the request through as that session's user. `/auth/logout` (POST only) clears the
    cookie and redirects to `/`.
 
 When SSO is configured, **all** routes require an authenticated session
@@ -51,7 +51,7 @@ assertion = b64url(JSON claims) "." b64url(HMAC-SHA256)
 | `sub` | string | Required. The user's stable subject id at edit.phext.io. |
 | `aud` | string | Must equal the app's audience: `exocortexia` (see `EXO_SSO_AUD`). Assertions minted for any other audience are rejected. |
 | `exp` | number (unix seconds) | Required. The assertion must not be expired (`now < exp`). |
-| `iat` | number (unix seconds) | If present: total lifetime must be at most 120 s (`exp - iat <= 120`) and `iat` must not be more than 30 s in the future (`iat <= now + 30`). |
+| `iat` | number (unix seconds) | Required. Total lifetime must be at most 120 s (`exp - iat <= 120`), `iat` must not be more than 30 s in the future (`iat <= now + 30`), and `exp` must not be more than 150 s past `now`. Assertions without `iat` are rejected (security pass, F-09). |
 | `jti` | string | Required. Unique assertion id; see replay protection. |
 | `handle` | string | Optional display handle, carried into the app session. |
 | `ret` | string | Optional return path the app redirects to after a successful callback. The app only honours safe local paths. |
@@ -61,10 +61,12 @@ assertion = b64url(JSON claims) "." b64url(HMAC-SHA256)
 Assertions live for **120 seconds** at most. Each app keeps an in-memory
 replay cache (`Mutex<HashMap<jti, exp>>`, swept by expiry): the first use
 of a `jti` is recorded, and any second presentation of the same assertion
-is rejected with `replay`. An assertion is therefore single-use — a leaked
-callback URL cannot be replayed, and after 120 s it is expired anyway.
-The cache is per-process and resets on restart, which is safe because the
-120 s expiry bounds the window regardless.
+is rejected with `replay`. An assertion is therefore single-use **per app
+process** — a leaked callback URL cannot be replayed *at the same app*,
+and after 120 s it is expired anyway. The cache is per-process and resets
+on restart, which is safe because the 120 s expiry bounds the window
+regardless. (Per-app audiences, below, are what stop one assertion being
+redeemed once at *each* app.)
 
 ## The app session cookie
 
@@ -76,9 +78,13 @@ edit):
 - Value: the same `b64url(JSON).b64url(HMAC-SHA256)` construction, keyed
   with `EXO_SESSION_SECRET`, carrying claims `sub`, `handle`, `exp`.
 - Lifetime: 12 hours (`exp = now + 12 * 3600`).
-- Attributes: `HttpOnly`, `SameSite=Lax`, host-only (no `Domain`
-  attribute, so the cookie is never sent to any other host, including
-  edit.phext.io).
+- Attributes: `HttpOnly`, `SameSite=Lax`, `Secure` (unless
+  `EXO_COOKIE_SECURE=0`), host-only (no `Domain` attribute, so the cookie
+  is never sent to any other host, including edit.phext.io).
+- The sealed claims also carry the sealing app's `aud`; a session sealed
+  by one app does not open in another, even if an operator reuses one
+  `EXO_SESSION_SECRET` across the suite. Use a distinct
+  `EXO_SESSION_SECRET` per app anyway.
 
 ## Configuration
 
@@ -87,16 +93,24 @@ edit):
 | `EDIT_SSO_URL` | yes | Edit-side SSO endpoint the app redirects sign-ins to. |
 | `EXO_SSO_SECRET` | yes | Shared secret used to verify edit's assertion signatures. Must be ≥ 32 characters. |
 | `EXO_SESSION_SECRET` | yes | This app's own session-sealing secret. Must be ≥ 32 characters. |
-| `EXO_SSO_AUD` | no | Expected assertion audience. Default: `exocortexia`. |
+| `EXO_SSO_AUD` | no | Expected assertion audience. Default: per-app, `exocortexia:<app>` (e.g. `exocortexia:records-desk`), so an assertion minted for one app is not valid at another. Set explicitly (e.g. to `exocortexia`) when the identity side mints one shared audience. |
+| `EXO_STAFF_SUBS` | no | Comma-separated `sub`/`handle` values allowed staff actions (records custodian view, forms transitions + CSV export). Empty = nobody; staff actions fail closed. |
+| `EXO_COOKIE_SECURE` | no | Set to `0` to omit the cookie `Secure` attribute (plain-HTTP demos on non-localhost addresses). |
+| `EXO_DEMO_MODE` | no | Set to `1` to run with SSO unconfigured (open local demo). Without it, an unconfigured or partially configured app refuses to start. |
 
 SSO counts as configured only when `EDIT_SSO_URL`, `EXO_SSO_SECRET`, and
 `EXO_SESSION_SECRET` are **all** set and both secrets are at least 32
-characters (`SsoConfig::from_env()` returns `None` otherwise).
+characters. Configuration is fail-closed (security pass, F-02): a
+*partial* or invalid configuration is a startup error, and running with
+no SSO configuration at all requires the explicit `EXO_DEMO_MODE=1`
+opt-in — an app never silently serves unauthenticated because of a
+typo'd variable name.
 
 ### Pass-through behaviour (SSO not configured)
 
-If SSO is not configured, the gate is disabled entirely: every route is
-open without sign-in, and HTML pages carry the banner
+If SSO is not configured *and* `EXO_DEMO_MODE=1` is set, the gate is
+disabled entirely: every route is open without sign-in, and HTML pages
+carry the banner
 **"AUTH DISABLED — local demo mode (SSO not configured)"**. This exists so
 the suite can be run and evaluated locally with zero setup. It is a demo
 mode only — never run a public deployment unconfigured. When SSO *is*
@@ -132,8 +146,11 @@ curl -s http://127.0.0.1:8799/health           # "ok" — minter liveness check
 
 The minter mints assertions for subject `mock:citizen-1`, handle
 `mock-citizen`, ttl 120 s, audience `EXO_SSO_AUD` (default `exocortexia`).
-Its port can be changed with `MOCK_PORT` (default 8799), and it also
-accepts `EXO_SSO_SECRET` in place of `MOCK_SSO_SECRET`.
+Its port can be changed with `MOCK_PORT` (default 8799). It requires
+`MOCK_SSO_SECRET` and deliberately never reads `EXO_SSO_SECRET` itself,
+and it is built only with the `mock-minter` cargo feature
+(`cargo build -p exo-sso --features mock-minter --bin edit-minter`), so
+default/production builds do not contain it (security pass, F-05).
 
 ## Production notes
 
