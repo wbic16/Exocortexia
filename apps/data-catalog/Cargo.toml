@@ -1,0 +1,9 @@
+[package]
+name = "data-catalog"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+exo-core = { path = "../../crates/core" }
+exo-sso = { path = "../../crates/sso" }
