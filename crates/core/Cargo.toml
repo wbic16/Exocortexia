@@ -1,0 +1,15 @@
+[package]
+name = "exo-core"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Exocortexia foundation: phext-backed Store, hash-chained audit log, statutory redactions, deterministic RNG, and a std-only mini HTTP server."
+
+[lib]
+name = "exo_core"
+path = "src/lib.rs"
+
+[dependencies]
+libphext = "0.4.0"
+sha2 = "0.10"
+socket2 = "0.5"
