@@ -47,7 +47,9 @@ pub const AUTH_DISABLED_BANNER: &str = "AUTH DISABLED — local demo mode (SSO n
 // Config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+/// SSO configuration. `Debug` is implemented manually so the two
+/// secrets can never be printed by a stray `{:?}` (F-15).
+#[derive(Clone)]
 pub struct SsoConfig {
     /// Base URL of the edit.phext.io SSO endpoint, e.g.
     /// `https://edit.phext.io/sso` (may itself carry a query string).
@@ -58,32 +60,119 @@ pub struct SsoConfig {
     pub session_secret: String,
     /// Audience this app accepts assertions for.
     pub aud: String,
+    /// Staff identities (`sub` or `handle` values) allowed to perform
+    /// staff actions (records custodian view, forms transitions and
+    /// bulk export). From `EXO_STAFF_SUBS` (comma-separated). Empty
+    /// means *nobody* is staff — staff actions fail closed.
+    pub staff_subs: Vec<String>,
+    /// Emit the `Secure` attribute on the session cookie. Default on;
+    /// `EXO_COOKIE_SECURE=0` turns it off for plain-HTTP local demos
+    /// on non-localhost addresses (browsers accept `Secure` cookies
+    /// from `http://127.0.0.1` as a trustworthy origin).
+    pub cookie_secure: bool,
+}
+
+impl std::fmt::Debug for SsoConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsoConfig")
+            .field("edit_sso_url", &self.edit_sso_url)
+            .field("sso_secret", &"<redacted>")
+            .field("session_secret", &"<redacted>")
+            .field("aud", &self.aud)
+            .field("staff_subs", &self.staff_subs)
+            .field("cookie_secure", &self.cookie_secure)
+            .finish()
+    }
 }
 
 impl SsoConfig {
-    /// Build from the environment. Returns `None` — SSO disabled, apps
-    /// run open in local demo mode — unless `EDIT_SSO_URL`,
-    /// `EXO_SSO_SECRET`, and `EXO_SESSION_SECRET` are all set and both
-    /// secrets are at least 32 bytes long.
+    /// Build from the environment, for the app named `app` (its slug,
+    /// e.g. `"records-desk"`).
     ///
-    /// Audience: `EXO_SSO_AUD`, default `"exocortexia"`.
-    pub fn from_env() -> Option<SsoConfig> {
-        let edit_sso_url = std::env::var("EDIT_SSO_URL").ok()?;
-        let sso_secret = std::env::var("EXO_SSO_SECRET").ok()?;
-        let session_secret = std::env::var("EXO_SESSION_SECRET").ok()?;
+    /// Fail-closed (F-02): SSO is enabled only when `EDIT_SSO_URL`,
+    /// `EXO_SSO_SECRET`, and `EXO_SESSION_SECRET` are all present and
+    /// both secrets are at least 32 bytes. Running *without* SSO is
+    /// possible only as an explicit opt-in via `EXO_DEMO_MODE=1`, in
+    /// which case this returns `None`. A *partial* or invalid SSO
+    /// configuration (a typo'd variable name, a too-short secret) is
+    /// a startup error — the process panics with the reason rather
+    /// than silently serving unauthenticated.
+    ///
+    /// Audience: `EXO_SSO_AUD`, defaulting to a per-app audience
+    /// `exocortexia:<app>` so one assertion cannot be redeemed at
+    /// every app in the suite (F-10). Set `EXO_SSO_AUD` explicitly
+    /// when the identity side mints a shared audience.
+    ///
+    /// Staff: `EXO_STAFF_SUBS`, comma-separated `sub`/`handle` values.
+    /// Cookie `Secure`: on unless `EXO_COOKIE_SECURE=0`.
+    pub fn from_env_for(app: &str) -> Option<SsoConfig> {
+        let edit_sso_url = std::env::var("EDIT_SSO_URL").ok();
+        let sso_secret = std::env::var("EXO_SSO_SECRET").ok();
+        let session_secret = std::env::var("EXO_SESSION_SECRET").ok();
+        let any_set = [&edit_sso_url, &sso_secret, &session_secret]
+            .iter()
+            .any(|v| v.is_some());
+        if !any_set {
+            if std::env::var("EXO_DEMO_MODE").map(|v| v == "1").unwrap_or(false) {
+                return None;
+            }
+            panic!(
+                "SSO is not configured (EDIT_SSO_URL / EXO_SSO_SECRET / EXO_SESSION_SECRET \
+                 are unset) and EXO_DEMO_MODE=1 was not given: refusing to start an \
+                 unauthenticated server. Set the SSO variables, or set EXO_DEMO_MODE=1 \
+                 for an explicitly open local demo."
+            );
+        }
+        let (edit_sso_url, sso_secret, session_secret) = match (edit_sso_url, sso_secret, session_secret) {
+            (Some(u), Some(a), Some(b)) => (u, a, b),
+            _ => panic!(
+                "partial SSO configuration: EDIT_SSO_URL, EXO_SSO_SECRET, and \
+                 EXO_SESSION_SECRET must all be set (check for typo'd variable names). \
+                 Refusing to start with the gate silently disabled."
+            ),
+        };
         if edit_sso_url.is_empty() || sso_secret.len() < 32 || session_secret.len() < 32 {
-            return None;
+            panic!(
+                "invalid SSO configuration: EDIT_SSO_URL must be non-empty and both \
+                 secrets at least 32 bytes. Refusing to start with the gate silently disabled."
+            );
         }
         let aud = std::env::var("EXO_SSO_AUD")
             .ok()
             .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| "exocortexia".to_string());
+            .unwrap_or_else(|| {
+                if app.is_empty() || app == "exocortexia" {
+                    "exocortexia".to_string()
+                } else {
+                    format!("exocortexia:{}", app)
+                }
+            });
+        let staff_subs = std::env::var("EXO_STAFF_SUBS")
+            .ok()
+            .map(|v| {
+                v.split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let cookie_secure = std::env::var("EXO_COOKIE_SECURE")
+            .map(|v| v != "0")
+            .unwrap_or(true);
         Some(SsoConfig {
             edit_sso_url,
             sso_secret,
             session_secret,
             aud,
+            staff_subs,
+            cookie_secure,
         })
+    }
+
+    /// [`SsoConfig::from_env_for`] with the shared default audience
+    /// stem, for callers that are not one specific app.
+    pub fn from_env() -> Option<SsoConfig> {
+        Self::from_env_for("exocortexia")
     }
 }
 
@@ -500,17 +589,26 @@ impl Sso {
             return Err("expired assertion".to_string());
         }
 
-        if let Some(iat) = claims.get("iat").and_then(|v| v.as_num()) {
-            if exp - iat > MAX_ASSERTION_LIFETIME_SECS {
-                return Err(format!(
-                    "assertion lifetime too long (exp-iat = {}s, max {}s)",
-                    exp - iat,
-                    MAX_ASSERTION_LIFETIME_SECS
-                ));
-            }
-            if iat > now + IAT_FUTURE_SKEW_SECS {
-                return Err("assertion issued in the future".to_string());
-            }
+        // `iat` is required (F-09): without it the issuer could opt
+        // out of the lifetime cap entirely by omitting the claim.
+        let iat = claims
+            .get("iat")
+            .and_then(|v| v.as_num())
+            .ok_or_else(|| "missing iat claim".to_string())?;
+        if exp - iat > MAX_ASSERTION_LIFETIME_SECS {
+            return Err(format!(
+                "assertion lifetime too long (exp-iat = {}s, max {}s)",
+                exp - iat,
+                MAX_ASSERTION_LIFETIME_SECS
+            ));
+        }
+        if iat > now + IAT_FUTURE_SKEW_SECS {
+            return Err("assertion issued in the future".to_string());
+        }
+        // Independently of `iat`: an assertion must not remain valid
+        // far into the future from *now*.
+        if exp - now > MAX_ASSERTION_LIFETIME_SECS + IAT_FUTURE_SKEW_SECS {
+            return Err("assertion expiry too far in the future".to_string());
         }
 
         let jti = claims
@@ -552,26 +650,34 @@ impl Sso {
     // -- sessions -----------------------------------------------------------
 
     /// Seal a session into an `exo_session` cookie value. The sealed
-    /// claims are `sub`, `handle`, and `exp = now + 12h` — the session
-    /// lifetime is fixed at seal time, regardless of how much life the
-    /// originating assertion had left.
+    /// claims are `sub`, `handle`, `aud` (this app's audience — a
+    /// session sealed by one app does not open in another, even when
+    /// an operator reuses one session secret across the suite, F-10),
+    /// and `exp = now + 12h` — the session lifetime is fixed at seal
+    /// time, regardless of how much life the originating assertion
+    /// had left.
     pub fn seal_session(&self, session: &Session) -> String {
         let exp = now_unix() + SESSION_TTL_SECS;
         let json = format!(
-            "{{\"sub\":\"{}\",\"handle\":\"{}\",\"exp\":{}}}",
+            "{{\"sub\":\"{}\",\"handle\":\"{}\",\"aud\":\"{}\",\"exp\":{}}}",
             json_escape(&session.sub),
             json_escape(&session.handle),
+            json_escape(&self.cfg.aud),
             exp
         );
         sign_token(&self.cfg.session_secret, &json)
     }
 
     /// Open an `exo_session` cookie value. `None` on any failure:
-    /// bad signature, malformed claims, missing `sub`, or expiry.
+    /// bad signature, malformed claims, missing `sub`, wrong
+    /// audience, or expiry.
     pub fn open_session(&self, value: &str) -> Option<Session> {
         let claims = verify_signed_token(&self.cfg.session_secret, value).ok()?;
         let exp = claims.get("exp").and_then(|v| v.as_num())?;
         if now_unix() >= exp {
+            return None;
+        }
+        if claims.get("aud").and_then(|v| v.as_str()) != Some(self.cfg.aud.as_str()) {
             return None;
         }
         let sub = claims
@@ -587,12 +693,39 @@ impl Sso {
         Some(Session { sub, handle, exp })
     }
 
+    /// True when `session` belongs to a staff identity
+    /// (`EXO_STAFF_SUBS`). Staff actions fail closed: with SSO
+    /// configured and no staff list, nobody qualifies.
+    pub fn is_staff(&self, session: &Session) -> bool {
+        self.cfg
+            .staff_subs
+            .iter()
+            .any(|s| s == &session.sub || s == &session.handle)
+    }
+
+    /// A CSRF token bound to this session (F-11): HMAC of the
+    /// session's identity and expiry under the session secret. A
+    /// cross-site form cannot know it, and it dies with the session.
+    pub fn csrf_token(&self, session: &Session) -> String {
+        let mac = hmac_sha256(
+            self.cfg.session_secret.as_bytes(),
+            format!("csrf|{}|{}", session.sub, session.exp).as_bytes(),
+        );
+        b64_encode(&mac)
+    }
+
+    /// Constant-time check of a submitted CSRF token.
+    pub fn csrf_ok(&self, session: &Session, token: &str) -> bool {
+        ct_eq(token.as_bytes(), self.csrf_token(session).as_bytes())
+    }
+
     /// The full `Set-Cookie` value string for a sealed session.
     fn session_cookie(&self, session: &Session) -> String {
         format!(
-            "exo_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+            "exo_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{}",
             self.seal_session(session),
-            SESSION_TTL_SECS
+            SESSION_TTL_SECS,
+            if self.cfg.cookie_secure { "; Secure" } else { "" }
         )
     }
 
@@ -609,10 +742,23 @@ impl Sso {
         match req.path.as_str() {
             "/auth/callback" => Gate::Respond(self.handle_callback(req)),
             "/auth/login" => Gate::Respond(self.handle_login(req)),
-            "/auth/logout" => Gate::Respond(
-                Response::redirect("/")
-                    .set_cookie("exo_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0"),
+            // Logout changes state, so it requires POST (F-19): a
+            // cross-site <img> GET must not be able to log a user out.
+            "/auth/logout" if req.method == "POST" => Gate::Respond(
+                Response::redirect("/").set_cookie(format!(
+                    "exo_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{}",
+                    if self.cfg.cookie_secure { "; Secure" } else { "" }
+                )),
             ),
+            "/auth/logout" => Gate::Respond(Response {
+                status: 405,
+                content_type: "text/plain; charset=utf-8".to_string(),
+                body: "logout requires POST".to_string(),
+                headers: Vec::new(),
+            }),
+            // Liveness probes are not behind the gate: /health reveals
+            // nothing and load balancers need it unauthenticated.
+            "/health" => Gate::PassThrough,
             _ => match req
                 .cookies
                 .get("exo_session")
@@ -658,7 +804,13 @@ impl Sso {
             Ok(claims) => Response::redirect(safe_ret_path(&claims.ret))
                 .set_cookie(self.session_cookie(&claims.session)),
             Err(why) => {
-                let mut r = Response::text(format!("SSO assertion rejected: {}", why));
+                // The detailed reason (including the expected
+                // audience, F-14) goes to the server log only; the
+                // unauthenticated caller gets a generic rejection.
+                eprintln!("sso: assertion rejected: {}", why);
+                let mut r = Response::text(
+                    "SSO assertion rejected: invalid or expired assertion".to_string(),
+                );
                 r.status = 401;
                 r
             }
@@ -710,6 +862,8 @@ mod tests {
             sso_secret: SSO_SECRET.to_string(),
             session_secret: SESSION_SECRET.to_string(),
             aud: "exocortexia".to_string(),
+            staff_subs: vec!["mock:citizen-1".to_string()],
+            cookie_secure: true,
         })
     }
 
@@ -961,8 +1115,16 @@ mod tests {
             _ => panic!("expected a 401 response"),
         }
 
-        // Logout -> 302 home, cookie cleared.
+        // Logout via GET is refused (F-19): state changes need POST.
         match sso.gate(&bare_request("/auth/logout")) {
+            Gate::Respond(r) => assert_eq!(r.status, 405),
+            _ => panic!("expected a 405 response"),
+        }
+
+        // Logout via POST -> 302 home, cookie cleared.
+        let mut logout = bare_request("/auth/logout");
+        logout.method = "POST".to_string();
+        match sso.gate(&logout) {
             Gate::Respond(r) => {
                 assert_eq!(r.status, 302);
                 assert_eq!(r.headers[0].1, "/");
@@ -973,6 +1135,70 @@ mod tests {
             }
             _ => panic!("expected a redirect response"),
         }
+    }
+
+    #[test]
+    fn assertion_without_iat_rejected() {
+        // F-09 regression: a correctly-signed assertion that omits
+        // `iat` must not slip past the lifetime cap.
+        let sso = test_sso();
+        let now = now_unix();
+        let json = format!(
+            "{{\"sub\":\"mock:citizen-1\",\"handle\":\"mock-citizen\",\"aud\":\"exocortexia\",\"ret\":\"/\",\"exp\":{},\"jti\":\"no-iat-1\"}}",
+            now + 60
+        );
+        let token = sign_token(SSO_SECRET, &json);
+        let err = sso
+            .verify_assertion(&token)
+            .expect_err("assertion without iat must be rejected");
+        assert!(err.contains("iat"), "got: {}", err);
+    }
+
+    #[test]
+    fn session_not_portable_across_audiences() {
+        // F-10 regression: a session sealed by one app must not open
+        // in another app, even with the same session secret.
+        let one = test_sso();
+        let mut cfg = one.cfg.clone();
+        cfg.aud = "exocortexia:other-app".to_string();
+        let other = Sso::new(cfg);
+        let session = Session {
+            sub: "mock:citizen-1".to_string(),
+            handle: "mock-citizen".to_string(),
+            exp: 0,
+        };
+        let sealed = one.seal_session(&session);
+        assert!(one.open_session(&sealed).is_some());
+        assert!(other.open_session(&sealed).is_none());
+    }
+
+    #[test]
+    fn csrf_token_is_session_bound() {
+        // F-11 support: tokens verify only for their own session.
+        let sso = test_sso();
+        let a = Session {
+            sub: "user-a".to_string(),
+            handle: "a".to_string(),
+            exp: now_unix() + 3600,
+        };
+        let b = Session {
+            sub: "user-b".to_string(),
+            handle: "b".to_string(),
+            exp: now_unix() + 3600,
+        };
+        let token = sso.csrf_token(&a);
+        assert!(sso.csrf_ok(&a, &token));
+        assert!(!sso.csrf_ok(&b, &token));
+        assert!(!sso.csrf_ok(&a, "forged"));
+    }
+
+    #[test]
+    fn config_debug_redacts_secrets() {
+        // F-15 regression.
+        let rendered = format!("{:?}", test_sso().cfg);
+        assert!(!rendered.contains(SSO_SECRET));
+        assert!(!rendered.contains(SESSION_SECRET));
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
