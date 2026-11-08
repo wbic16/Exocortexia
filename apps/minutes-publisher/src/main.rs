@@ -310,6 +310,12 @@ fn build_state() -> AppState {
     let mut store = Store::new();
     let mut audit_store = Store::new();
     let mut audit = AuditLog::new();
+    // Optional keyed audit chain (F-04), as in records-desk.
+    if let Ok(k) = std::env::var("EXO_AUDIT_KEY") {
+        if !k.is_empty() {
+            audit.set_key(k.as_bytes());
+        }
+    }
     let mut rng = Rng(23);
     for (b, board_name) in BOARD_NAMES.iter().enumerate() {
         for m in 0..MEETINGS_PER_BOARD {
@@ -443,7 +449,7 @@ fn not_found(what: &str) -> Response {
     Response {
         status: 404,
         content_type: "text/plain; charset=utf-8".to_string(),
-        body: format!("not found: {}", what),
+        body: format!("not found: {}", esc(what)),
         headers: Vec::new(),
     }
 }
@@ -658,16 +664,31 @@ fn handle_static(state: &AppState, banner: &str, session: Option<&Session>) -> R
         }
         body.push_str("</tbody></table>");
     }
-    // Proof of posting: the hash-chained audit log.
+    // Proof of posting: the hash-chained audit log. The claim made
+    // here is exactly what the chain proves (F-04): the entries
+    // present are internally consistent. The head commitment below
+    // is the anchor a reader can pin and later compare against —
+    // if tail entries were dropped, the commitment changes.
     body.push_str("<h2>Proof of posting</h2>");
     match state.audit.verify() {
-        Ok(()) => body
-            .push_str("<p>Audit chain verified: every entry hash chains to its predecessor.</p>"),
+        Ok(()) => body.push_str(
+            "<p>Audit chain verified: every entry present hash-chains to its \
+             predecessor, with no gaps. This proves the internal consistency \
+             of the entries shown — pin the head commitment below and \
+             re-check it later to also detect dropped tail entries.</p>",
+        ),
         Err(e) => body.push_str(&format!(
             "<p>Audit chain verification FAILED: {}</p>",
             esc(&e)
         )),
     }
+    let (entry_count, head_hash) = state.audit.head();
+    body.push_str(&format!(
+        "<p>Entries: {}. Head hash: <code>{}</code>. Head commitment: <code>{}</code></p>",
+        entry_count,
+        esc(&head_hash),
+        esc(&state.audit.head_commitment())
+    ));
     body.push_str(
         "<table><thead><tr><th>Seq</th><th>Action</th><th>Coordinate</th><th>Hash (prefix)</th></tr></thead><tbody>",
     );
@@ -703,19 +724,19 @@ fn route(
     let session_ref = session.as_ref();
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/") => {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
             handle_index(&st, banner, session_ref)
         }
         ("GET", "/board") => {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
             handle_board(&st, banner, session_ref, req)
         }
         ("GET", "/api/compliance") => {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
             handle_api_compliance(&st)
         }
         ("GET", "/static") => {
-            let st = state.lock().unwrap();
+            let st = state.lock().unwrap_or_else(|e| e.into_inner());
             handle_static(&st, banner, session_ref)
         }
         _ => not_found(&req.path),
@@ -728,7 +749,7 @@ fn main() -> std::io::Result<()> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8802);
     let state = Arc::new(Mutex::new(build_state()));
-    let sso = SsoConfig::from_env().map(Sso::new);
+    let sso = SsoConfig::from_env_for("minutes-publisher").map(Sso::new);
     let banner = match &sso {
         Some(s) => s.banner_html().to_string(),
         None => "AUTH DISABLED — local demo mode (SSO not configured)".to_string(),

@@ -63,12 +63,51 @@ pub fn is_stale(last_updated_day: i64, cadence_days: i64, today: i64) -> bool {
     today - last_updated_day > cadence_days
 }
 
+/// SSRF guard (F-21): is this IP one the link checker must never
+/// connect to? Blocked: private ranges, link-local (including the
+/// cloud metadata address 169.254.169.254), CGNAT shared space,
+/// multicast, and unspecified — for IPv6 also unique-local and
+/// link-local. Loopback is allowed: the demo's own datasets point at
+/// loopback by design (this app's `/health`, the discard port), and
+/// loopback reaches only the host the app already runs on.
+pub fn ip_blocked(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_loopback() {
+                return false;
+            }
+            let octets = v4.octets();
+            v4.is_private()
+                || v4.is_link_local()
+                || v4.is_multicast()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || (octets[0] == 100 && (octets[1] & 0xC0) == 64)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return false;
+            }
+            let seg0 = v6.segments()[0];
+            v6.is_multicast()
+                || v6.is_unspecified()
+                || (seg0 & 0xFFC0) == 0xFE80
+                || (seg0 & 0xFE00) == 0xFC00
+        }
+    }
+}
+
 /// Check whether an http:// URL answers, using only std networking.
 ///
 /// Behaviour, honestly stated:
 ///   * `https://` URLs are NOT checked: returns
 ///     `(false, "https not checked in demo")`.
 ///   * Other non-http schemes return `(false, "unsupported scheme ...")`.
+///   * SSRF guard: if the host resolves to *any* non-public address
+///     (see `ip_blocked`), the check is refused before connecting —
+///     this is what stops the checker being aimed at LAN services or
+///     the cloud metadata endpoint if dataset URLs ever become data
+///     rather than compiled-in seed values.
 ///   * The host is resolved with `ToSocketAddrs`, connected with a 5-second
 ///     `connect_timeout`, and sent a minimal `GET` request. Read/write
 ///     timeouts are also 5 seconds.
@@ -99,13 +138,21 @@ pub fn check_url(url: &str) -> (bool, String) {
     };
 
     let addr_str = format!("{}:{}", host, port);
-    let mut addrs = match addr_str.to_socket_addrs() {
-        Ok(a) => a,
+    let resolved: Vec<std::net::SocketAddr> = match addr_str.to_socket_addrs() {
+        Ok(a) => a.collect(),
         Err(e) => return (false, format!("cannot resolve {}: {}", addr_str, e)),
     };
-    let Some(addr) = addrs.next() else {
+    let Some(addr) = resolved.first().copied() else {
         return (false, format!("cannot resolve {}", addr_str));
     };
+    // Check *every* resolved address, not just the one we connect to:
+    // a name that mixes public and non-public answers is refused.
+    if resolved.iter().any(|a| ip_blocked(&a.ip())) {
+        return (
+            false,
+            "refused: host resolves to a non-public address (SSRF guard)".to_string(),
+        );
+    }
 
     let mut stream = match TcpStream::connect_timeout(&addr, Duration::from_secs(5)) {
         Ok(s) => s,
@@ -494,7 +541,19 @@ fn route(req: &Request, sess: Option<&Session>, datasets: &[Dataset], banner: &s
         ("GET", "/") => index_page(datasets, today, banner, sess_ref),
         ("GET", "/api/staleness") => staleness_json(datasets, today),
         ("GET", "/api/links") => links_json(datasets),
-        ("POST", "/api/check-links") => links_json(datasets),
+        ("POST", "/api/check-links") => {
+            // Triggering outbound checks is a POST: refuse cross-site
+            // triggers (F-11 floor; the route changes no state).
+            if !exo_core::http::origin_matches_host(req) {
+                return Response {
+                    status: 403,
+                    content_type: "text/plain; charset=utf-8".to_string(),
+                    body: "cross-origin request refused".to_string(),
+                    headers: Vec::new(),
+                };
+            }
+            links_json(datasets)
+        }
         _ => Response {
             status: 404,
             content_type: "text/plain; charset=utf-8".to_string(),
@@ -514,7 +573,7 @@ fn main() -> std::io::Result<()> {
     let store = seed_store(today, port);
     let datasets = Arc::new(load_catalog(&store));
 
-    let sso = SsoConfig::from_env().map(Sso::new);
+    let sso = SsoConfig::from_env_for("data-catalog").map(Sso::new);
     let banner: String = match &sso {
         Some(s) => s.banner_html().to_string(),
         None => "AUTH DISABLED — local demo mode (SSO not configured)".to_string(),
@@ -585,6 +644,42 @@ mod tests {
         let (ok, detail) = check_url("http://127.0.0.1:9/state-contracts-extract");
         assert!(!ok);
         assert!(!detail.is_empty());
+    }
+
+    #[test]
+    fn ssrf_guard_blocks_non_public_addresses() {
+        // F-21 regression: the metadata address, RFC-1918 ranges,
+        // link-local, and CGNAT space are refused; loopback (the
+        // demo's own design) and public addresses are not.
+        use std::net::IpAddr;
+        for blocked in [
+            "169.254.169.254",
+            "10.0.0.5",
+            "172.16.4.4",
+            "192.168.1.20",
+            "100.64.0.1",
+            "224.0.0.1",
+            "0.0.0.0",
+        ] {
+            assert!(
+                ip_blocked(&blocked.parse::<IpAddr>().unwrap()),
+                "{} must be blocked",
+                blocked
+            );
+        }
+        for allowed in ["127.0.0.1", "8.8.8.8", "1.1.1.1", "203.0.113.9"] {
+            assert!(
+                !ip_blocked(&allowed.parse::<IpAddr>().unwrap()),
+                "{} must be allowed",
+                allowed
+            );
+        }
+        // The guard fires before any connection attempt, with a
+        // stated reason — 169.254.169.254 would otherwise hang or
+        // answer depending on the host network.
+        let (ok, detail) = check_url("http://169.254.169.254/latest/meta-data/");
+        assert!(!ok);
+        assert!(detail.contains("SSRF guard"), "got: {}", detail);
     }
 
     #[test]

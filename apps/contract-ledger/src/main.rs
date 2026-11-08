@@ -569,7 +569,7 @@ fn main() -> std::io::Result<()> {
         amendments,
     });
 
-    let sso = SsoConfig::from_env().map(Sso::new);
+    let sso = SsoConfig::from_env_for("contract-ledger").map(Sso::new);
     let banner: String = match &sso {
         Some(s) => s.banner_html().to_string(),
         None => "AUTH DISABLED — local demo mode (SSO not configured)".to_string(),
